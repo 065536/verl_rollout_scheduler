@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Logs and results
+logs/
+profiling_results/
+*.log
+
+# Scheduling files (generated from experiments)
+schedules/
+
+# Data files
+data/*.parquet
+data/*.json
+data/scheduling_plans/*.json
+data/scheduling_plans/*.csv
+
+# Checkpoints
+ckpts/
+
+# Environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Ray cluster files
+/tmp/ray/
+/tmp/plasma-*
+
+# Model checkpoints and weights (if any)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Coverage reports
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
