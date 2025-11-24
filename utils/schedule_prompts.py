@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bin Packing调度算法
-将prompts根据avg response length分配到replicas，实现负载均衡
+将prompts根据(prompt_len + avg_response_len)的估计总tokens分配到replicas，实现负载均衡
 """
 
 import json
@@ -16,7 +16,7 @@ def best_fit_decreasing(items: List[Tuple[int, float]], num_bins: int) -> Tuple[
     Best Fit Decreasing算法：将items分配到bins中，使得负载最均衡
     
     Args:
-        items: List of (prompt_id, weight) tuples, where weight is avg_response_length
+        items: List of (prompt_id, weight) tuples, where weight是估计的prompt+response总tokens
         num_bins: Number of bins (replicas)
     
     Returns:
@@ -60,8 +60,11 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
     # 获取数据
     if 'all_per_prompt_avg_response_lengths' not in data:
         raise ValueError("JSON文件中未找到all_per_prompt_avg_response_lengths数据")
+    if 'all_per_prompt_prompt_lengths' not in data:
+        raise ValueError("JSON文件中未找到all_per_prompt_prompt_lengths数据")
     
     avg_lengths = data['all_per_prompt_avg_response_lengths']
+    prompt_lengths = data['all_per_prompt_prompt_lengths']
     
     # 获取replicas数量
     if num_replicas is None:
@@ -70,10 +73,27 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
         print(f"从JSON中读取replicas数量: {num_replicas}")
     
     # 准备数据
-    items = [(int(pid), float(length)) 
-             for pid, length in sorted(avg_lengths.items(), key=lambda x: int(x[0]))]
+    items = []
+    prompt_stats = {}
+    total_prompt_tokens = 0.0
+    total_response_tokens = 0.0
     
-    total_tokens = sum(length for _, length in items)
+    for pid_str, avg_resp_len in sorted(avg_lengths.items(), key=lambda x: int(x[0])):
+        prompt_len = float(prompt_lengths.get(pid_str, 0.0))
+        avg_resp_len = float(avg_resp_len)
+        total_len = prompt_len + avg_resp_len
+        
+        pid = int(pid_str)
+        items.append((pid, total_len))
+        prompt_stats[pid] = {
+            'prompt_length': prompt_len,
+            'avg_response_length': avg_resp_len,
+            'estimated_total_tokens': total_len,
+        }
+        total_prompt_tokens += prompt_len
+        total_response_tokens += avg_resp_len
+    
+    total_tokens = total_prompt_tokens + total_response_tokens
     ideal_tokens_per_replica = total_tokens / num_replicas
     
     print("=" * 70)
@@ -82,7 +102,9 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
     print(f"\n【输入数据】")
     print(f"Prompts数量: {len(items)}")
     print(f"Replicas数量: {num_replicas}")
-    print(f"总response tokens: {total_tokens:.0f}")
+    print(f"总prompt tokens: {total_prompt_tokens:.0f}")
+    print(f"总response tokens: {total_response_tokens:.0f}")
+    print(f"估计总tokens(prompt+response): {total_tokens:.0f}")
     print(f"理想平均每个replica: {ideal_tokens_per_replica:.0f} tokens")
     
     # 执行调度
@@ -111,12 +133,21 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
         'num_prompts': len(items),
         'total_tokens': total_tokens,
         'ideal_tokens_per_replica': ideal_tokens_per_replica,
+        'total_prompt_tokens': total_prompt_tokens,
+        'total_response_tokens': total_response_tokens,
         'replicas': [
             {
                 'replica_id': i,
                 'prompt_ids': [pid for pid, _ in bin_items],
-                'prompts': [{'prompt_id': pid, 'avg_response_length': length} 
-                           for pid, length in bin_items],
+                'prompts': [
+                    {
+                        'prompt_id': pid,
+                        'prompt_length': prompt_stats[pid]['prompt_length'],
+                        'avg_response_length': prompt_stats[pid]['avg_response_length'],
+                        'estimated_total_tokens': prompt_stats[pid]['estimated_total_tokens'],
+                    }
+                    for pid, _ in bin_items
+                ],
                 'total_tokens': float(bin_sum),
                 'num_prompts': len(bin_items),
                 'avg_tokens_per_prompt': float(bin_sum / len(bin_items)) if len(bin_items) > 0 else 0,

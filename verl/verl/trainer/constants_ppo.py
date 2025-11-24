@@ -49,4 +49,18 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    
+    # Automatically pass scheduling-related environment variables to Ray workers
+    # These are set by the shell script and need to be available in worker processes
+    scheduling_env_vars = [
+        "VERL_ENABLE_SHUFFLE",
+        "VERL_SHUFFLE_SEED",
+        "VERL_BIN_PACKING_SCHEDULE_FILE",
+        "VERL_SCHEDULE_MODE",
+    ]
+    for env_var in scheduling_env_vars:
+        env_value = os.environ.get(env_var)
+        if env_value is not None:
+            runtime_env["env_vars"][env_var] = env_value
+    
     return runtime_env

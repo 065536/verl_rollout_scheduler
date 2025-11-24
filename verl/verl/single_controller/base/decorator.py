@@ -274,15 +274,38 @@ def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output)
     return _concat_data_proto_or_future(output)
 
 
+def _ensure_mesh_registration(worker_group, mesh_name):
+    """Ensure dispatch/collect info exists for the given mesh."""
+    if mesh_name not in worker_group._dispatch_info:
+        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+        assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
+    if mesh_name not in worker_group._collect_info:
+        worker_group._collect_info[mesh_name] = worker_group._query_collect_info(mesh_name)
+        assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
+
+
 def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
 
     assert isinstance(worker_group, WorkerGroup)
 
+    # Check if bin packing dispatch should be used (for rollout mesh)
+    # This allows bin packing scheduling to work at the dispatch level
+    if mesh_name == "rollout":
+        try:
+            from verl.utils.bin_packing_scheduler import get_bin_packing_scheduler
+            bin_packing_scheduler = get_bin_packing_scheduler()
+            if bin_packing_scheduler is not None:
+                _ensure_mesh_registration(worker_group, mesh_name)
+                # Use bin packing dispatch instead of default chunk dispatch
+                from verl.single_controller.base.bin_packing_dispatch import dispatch_bin_packing_data_proto
+                return dispatch_bin_packing_data_proto(worker_group, *args, **kwargs)
+        except (ImportError, Exception):
+            # Fall through to default dispatch if bin packing is not available
+            pass
+
     # query dispatch info of the worker group
-    if mesh_name not in worker_group._dispatch_info:
-        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
-        assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
+    _ensure_mesh_registration(worker_group, mesh_name)
 
     dp_rank_mapping = worker_group._dispatch_info[mesh_name]
     # perform dispatch
@@ -295,12 +318,7 @@ def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
 
     assert isinstance(worker_group, WorkerGroup)
 
-    # the dispatch info is stored in the worker group
-    assert mesh_name in worker_group._dispatch_info
-
-    if mesh_name not in worker_group._collect_info:
-        worker_group._collect_info[mesh_name] = worker_group._query_collect_info(mesh_name)
-        assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
+    _ensure_mesh_registration(worker_group, mesh_name)
 
     # a boolean of whether the dp_rank is used for collect
     collect_mask = worker_group._collect_info[mesh_name]

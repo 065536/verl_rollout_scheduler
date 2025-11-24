@@ -571,14 +571,14 @@ class RayPPOTrainer:
             )
             print(f"  After repeat: {len(test_batch)} prompts")
             
-            # Apply scheduling for validation (bin packing, shuffle, or default)
+            # Apply scheduling on the validation batch itself so that later unions keep ordering aligned
             test_batch = self._apply_scheduling_validation(test_batch)
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Store original inputs
+            # Store original inputs (must be done before _get_gen_batch which removes input_ids)
             input_ids = test_batch.batch["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
@@ -590,6 +590,7 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
+            # Get generation batch (removes input_ids, attention_mask, position_ids)
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -600,10 +601,10 @@ class RayPPOTrainer:
                 "global_steps": self.global_steps,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-            
-            # Apply scheduling if enabled (before repeat)
-            # Note: For validation, we apply scheduling after repeat since val_kwargs.n=1
-            test_gen_batch = self._apply_scheduling_validation(test_gen_batch)
+            # Preserve scheduling metadata if present on the repeated batch
+            for key in ["shuffle_scheduled", "shuffle_seed", "shuffled_indices", "bin_packing_scheduled"]:
+                if key in test_batch.meta_info:
+                    test_gen_batch.meta_info[key] = test_batch.meta_info[key]
 
             # pad to be divisible by dp_size
             size_divisor = (
@@ -712,31 +713,67 @@ class RayPPOTrainer:
             print(f"  rollout.n (for reference): {rollout_n}")
             
             # Group response lengths by original prompt ID
-            # Since prompts are repeated with interleave=True, the order is:
-            # [Prompt 0 (gen 1), Prompt 0 (gen 2), ..., Prompt 0 (gen n),
-            #  Prompt 1 (gen 1), Prompt 1 (gen 2), ..., Prompt 1 (gen n), ...]
-            # Use actual_n (val_kwargs.n) for validation, not rollout.n
-            num_original_prompts = len(response_lengths) // actual_n if actual_n > 0 else len(response_lengths)
-            print(f"  Calculated num_original_prompts: {num_original_prompts} (from {len(response_lengths)} responses / {actual_n})")
-            per_prompt_response_lengths = {}  # {prompt_id: [length1, length2, ..., length_n]}
-            per_prompt_prompt_lengths = {}  # {prompt_id: prompt_length}
-            per_prompt_avg_response_lengths = {}  # {prompt_id: avg_length}
+            # IMPORTANT: If data was shuffled, we need to recover the original prompt_id mapping
+            # Check if shuffle was applied
+            shuffled_indices = test_output_gen_batch.meta_info.get("shuffled_indices", None)
+            is_shuffled = shuffled_indices is not None
             
-            for prompt_id in range(num_original_prompts):
-                # Extract n response lengths for this prompt
-                # Use actual_n (val_kwargs.n) for validation, not rollout.n
-                start_idx = prompt_id * actual_n
-                end_idx = start_idx + actual_n
-                prompt_response_lengths = response_lengths[start_idx:end_idx]
-                prompt_length = prompt_lengths[start_idx] if start_idx < len(prompt_lengths) else 0
+            if is_shuffled:
+                print(f"[DEBUG] Data was shuffled, recovering original prompt_id mapping using shuffled_indices")
+                # Create reverse mapping: from shuffled position to original prompt_id
+                # shuffled_indices[i] is the original index of the item at position i after shuffle
+                num_original_prompts = len(response_lengths) // actual_n if actual_n > 0 else len(response_lengths)
                 
-                per_prompt_response_lengths[prompt_id] = prompt_response_lengths
-                per_prompt_prompt_lengths[prompt_id] = prompt_length
+                # Build mapping: shuffled_position -> original_prompt_id
+                shuffled_to_original_prompt = {}
+                for shuffled_pos in range(len(shuffled_indices)):
+                    original_idx = shuffled_indices[shuffled_pos]
+                    original_prompt_id = original_idx // actual_n
+                    shuffled_to_original_prompt[shuffled_pos] = original_prompt_id
                 
-                # Calculate average response length for this prompt
-                if prompt_response_lengths:
-                    avg_length = sum(prompt_response_lengths) / len(prompt_response_lengths)
-                    per_prompt_avg_response_lengths[prompt_id] = avg_length
+                # Group response_lengths by original prompt_id
+                per_prompt_response_lengths = {}  # {prompt_id: [length1, length2, ..., length_n]}
+                per_prompt_prompt_lengths = {}  # {prompt_id: prompt_length}
+                per_prompt_avg_response_lengths = {}  # {prompt_id: avg_length}
+                
+                for shuffled_pos in range(len(response_lengths)):
+                    original_prompt_id = shuffled_to_original_prompt.get(shuffled_pos, shuffled_pos // actual_n)
+                    if original_prompt_id not in per_prompt_response_lengths:
+                        per_prompt_response_lengths[original_prompt_id] = []
+                        per_prompt_prompt_lengths[original_prompt_id] = prompt_lengths[shuffled_pos] if shuffled_pos < len(prompt_lengths) else 0
+                    per_prompt_response_lengths[original_prompt_id].append(response_lengths[shuffled_pos])
+                
+                # Calculate average for each prompt
+                for prompt_id in per_prompt_response_lengths:
+                    prompt_response_lengths = per_prompt_response_lengths[prompt_id]
+                    if prompt_response_lengths:
+                        avg_length = sum(prompt_response_lengths) / len(prompt_response_lengths)
+                        per_prompt_avg_response_lengths[prompt_id] = avg_length
+                
+                print(f"[DEBUG] Recovered {len(per_prompt_avg_response_lengths)} prompts from shuffled data")
+            else:
+                # Original order: [Prompt 0 (gen 1), Prompt 0 (gen 2), ..., Prompt 0 (gen n), Prompt 1 (gen 1), ...]
+                num_original_prompts = len(response_lengths) // actual_n if actual_n > 0 else len(response_lengths)
+                print(f"  Calculated num_original_prompts: {num_original_prompts} (from {len(response_lengths)} responses / {actual_n})")
+                per_prompt_response_lengths = {}  # {prompt_id: [length1, length2, ..., length_n]}
+                per_prompt_prompt_lengths = {}  # {prompt_id: prompt_length}
+                per_prompt_avg_response_lengths = {}  # {prompt_id: avg_length}
+                
+                for prompt_id in range(num_original_prompts):
+                    # Extract n response lengths for this prompt
+                    # Use actual_n (val_kwargs.n) for validation, not rollout.n
+                    start_idx = prompt_id * actual_n
+                    end_idx = start_idx + actual_n
+                    prompt_response_lengths = response_lengths[start_idx:end_idx]
+                    prompt_length = prompt_lengths[start_idx] if start_idx < len(prompt_lengths) else 0
+                    
+                    per_prompt_response_lengths[prompt_id] = prompt_response_lengths
+                    per_prompt_prompt_lengths[prompt_id] = prompt_length
+                    
+                    # Calculate average response length for this prompt
+                    if prompt_response_lengths:
+                        avg_length = sum(prompt_response_lengths) / len(prompt_response_lengths)
+                        per_prompt_avg_response_lengths[prompt_id] = avg_length
             
             # Get per-worker timing (actual measurements if available, otherwise estimate)
             per_worker_times = []
@@ -781,10 +818,118 @@ class RayPPOTrainer:
                     'note': 'single worker',
                 })
             
-            # Distribute tokens across workers (estimate)
-            tokens_per_worker = total_response_tokens / num_workers if num_workers > 0 else total_response_tokens
-            for worker_data in per_worker_times:
-                worker_data['response_tokens'] = int(tokens_per_worker)
+            # Calculate per-worker/replica tokens based on actual prompt assignment
+            # Try to get actual prompt assignment from scheduler (bin_packing or shuffle)
+            per_replica_tokens = {}
+            per_worker_tokens_calculated = False
+            
+            try:
+                # Check schedule mode (check both VERL_SCHEDULE_MODE and VERL_ENABLE_SHUFFLE)
+                import os
+                schedule_mode_check = os.getenv("VERL_SCHEDULE_MODE", "default").lower()
+                shuffle_enabled = os.getenv("VERL_ENABLE_SHUFFLE", "false").lower() in ["true", "1", "yes"]
+                
+                # Determine actual schedule mode
+                if schedule_mode_check == "bin_packing":
+                    actual_schedule_mode = "bin_packing"
+                elif schedule_mode_check == "shuffle" or shuffle_enabled:
+                    actual_schedule_mode = "shuffle"
+                else:
+                    actual_schedule_mode = "default"
+                
+                # Safety check: If shuffle is expected but schedule_mode is still default, raise error
+                expected_shuffle = (schedule_mode_check == "shuffle" or shuffle_enabled)
+                if expected_shuffle and actual_schedule_mode == "default":
+                    error_msg = (
+                        f"ERROR: Shuffle scheduling was requested but schedule_mode is still 'default'!\n"
+                        f"  VERL_SCHEDULE_MODE={os.getenv('VERL_SCHEDULE_MODE', 'not set')}\n"
+                        f"  VERL_ENABLE_SHUFFLE={os.getenv('VERL_ENABLE_SHUFFLE', 'not set')}\n"
+                        f"  Detected schedule_mode={actual_schedule_mode}\n"
+                        f"  This indicates that environment variables are not being passed to Ray workers correctly.\n"
+                        f"  Please check that get_ppo_ray_runtime_env() includes these variables in runtime_env."
+                    )
+                    print(f"[FATAL ERROR] {error_msg}")
+                    raise RuntimeError(error_msg)
+                
+                # Check if bin packing scheduler is available
+                if actual_schedule_mode == "bin_packing":
+                    from verl.utils.bin_packing_scheduler import get_bin_packing_scheduler
+                    bin_packing_scheduler = get_bin_packing_scheduler()
+                    
+                    if bin_packing_scheduler is not None and per_prompt_avg_response_lengths:
+                        # Calculate tokens per replica based on bin packing schedule
+                        for replica_id in range(num_replicas):
+                            prompt_ids = bin_packing_scheduler.get_prompts_for_replica(replica_id)
+                            replica_tokens = 0
+                            for prompt_id in prompt_ids:
+                                # per_prompt_avg_response_lengths uses integer keys
+                                if prompt_id in per_prompt_avg_response_lengths:
+                                    replica_tokens += per_prompt_avg_response_lengths[prompt_id]
+                            per_replica_tokens[replica_id] = replica_tokens
+                        
+                        # Distribute replica tokens to workers
+                        for worker_data in per_worker_times:
+                            replica_id = worker_data['replica_id']
+                            if replica_id in per_replica_tokens:
+                                worker_data['response_tokens'] = int(per_replica_tokens[replica_id])
+                            else:
+                                worker_data['response_tokens'] = int(total_response_tokens / num_workers)
+                        per_worker_tokens_calculated = True
+                        print(f"[DEBUG] Calculated per-worker tokens based on bin packing schedule")
+                
+                # Check if shuffle scheduler is available
+                elif actual_schedule_mode == "shuffle":
+                    from verl.utils.shuffle_scheduler import get_shuffle_scheduler
+                    shuffle_scheduler = get_shuffle_scheduler()
+                    
+                    if shuffle_scheduler is not None and per_prompt_avg_response_lengths:
+                        # Get shuffled indices to determine which prompts go to which replica
+                        shuffled_indices = shuffle_scheduler.get_shuffled_indices(len(response_lengths), actual_n)
+                        prompts_per_replica = len(response_lengths) // num_replicas
+                        
+                        # Calculate tokens per replica based on shuffled assignment
+                        for replica_id in range(num_replicas):
+                            start_pos = replica_id * prompts_per_replica
+                            end_pos = (replica_id + 1) * prompts_per_replica if replica_id < num_replicas - 1 else len(shuffled_indices)
+                            
+                            # Get the shuffled indices for this replica's positions
+                            replica_shuffled_indices = shuffled_indices[start_pos:end_pos]
+                            
+                            # Convert to original prompt IDs and calculate tokens
+                            replica_tokens = 0
+                            replica_prompt_ids_set = set()
+                            for shuffled_idx in replica_shuffled_indices:
+                                original_prompt_id = shuffled_idx // actual_n
+                                replica_prompt_ids_set.add(original_prompt_id)
+                            
+                            # Calculate tokens for this replica
+                            for prompt_id in replica_prompt_ids_set:
+                                # per_prompt_avg_response_lengths uses integer keys
+                                if prompt_id in per_prompt_avg_response_lengths:
+                                    replica_tokens += per_prompt_avg_response_lengths[prompt_id]
+                            
+                            per_replica_tokens[replica_id] = replica_tokens
+                        
+                        # Distribute replica tokens to workers
+                        for worker_data in per_worker_times:
+                            replica_id = worker_data['replica_id']
+                            if replica_id in per_replica_tokens:
+                                worker_data['response_tokens'] = int(per_replica_tokens[replica_id])
+                            else:
+                                worker_data['response_tokens'] = int(total_response_tokens / num_workers)
+                        per_worker_tokens_calculated = True
+                        print(f"[DEBUG] Calculated per-worker tokens based on shuffle schedule")
+                
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to calculate per-worker tokens from scheduler: {e}")
+            
+            # Fallback: if we couldn't calculate from scheduler, use average distribution
+            if not per_worker_tokens_calculated:
+                tokens_per_worker = total_response_tokens / num_workers if num_workers > 0 else total_response_tokens
+                for worker_data in per_worker_times:
+                    worker_data['response_tokens'] = int(tokens_per_worker)
+                print(f"[DEBUG] Using average token distribution (scheduler not available or failed)")
             
             # Note: We don't track per-replica statistics because we cannot directly measure
             # each replica's individual completion time. All replicas execute in parallel,
@@ -820,7 +965,184 @@ class RayPPOTrainer:
             self._validation_rollout_metrics['total_prompt_tokens'] += total_prompt_tokens
             self._validation_rollout_metrics['num_batches'] += 1
             
+            # Record per-replica prompt assignment (for verification)
+            # This helps verify that scheduling (bin_packing/shuffle) is actually working
+            per_replica_prompt_ids = {}
+            per_replica_prompt_response_lengths = {}  # NEW: record response lengths for each prompt in each replica
+            import os
+            # Check schedule mode (check both VERL_SCHEDULE_MODE and VERL_ENABLE_SHUFFLE)
+            schedule_mode_check = os.getenv("VERL_SCHEDULE_MODE", "default").lower()
+            shuffle_enabled = os.getenv("VERL_ENABLE_SHUFFLE", "false").lower() in ["true", "1", "yes"]
+            
+            # Debug: print environment variables
+            print(f"[DEBUG] Recording per-replica prompt assignment:")
+            print(f"  VERL_SCHEDULE_MODE={schedule_mode_check}")
+            print(f"  VERL_ENABLE_SHUFFLE={os.getenv('VERL_ENABLE_SHUFFLE', 'not set')}, shuffle_enabled={shuffle_enabled}")
+            
+            # Determine actual schedule mode
+            if schedule_mode_check == "bin_packing":
+                schedule_mode = "bin_packing"
+            elif schedule_mode_check == "shuffle" or shuffle_enabled:
+                schedule_mode = "shuffle"
+            else:
+                schedule_mode = "default"
+            
+            print(f"[DEBUG] Determined schedule_mode: {schedule_mode}")
+            
+            # Safety check: If shuffle is expected but schedule_mode is still default, raise error
+            expected_shuffle = (schedule_mode_check == "shuffle" or shuffle_enabled)
+            if expected_shuffle and schedule_mode == "default":
+                error_msg = (
+                    f"ERROR: Shuffle scheduling was requested but schedule_mode is still 'default'!\n"
+                    f"  VERL_SCHEDULE_MODE={os.getenv('VERL_SCHEDULE_MODE', 'not set')}\n"
+                    f"  VERL_ENABLE_SHUFFLE={os.getenv('VERL_ENABLE_SHUFFLE', 'not set')}\n"
+                    f"  Detected schedule_mode={schedule_mode}\n"
+                    f"  This indicates that environment variables are not being passed to Ray workers correctly.\n"
+                    f"  Please check that get_ppo_ray_runtime_env() includes these variables in runtime_env."
+                )
+                print(f"[FATAL ERROR] {error_msg}")
+                raise RuntimeError(error_msg)
+            
+            try:
+                if schedule_mode == "bin_packing":
+                    # Get prompt assignment from bin packing scheduler
+                    from verl.utils.bin_packing_scheduler import get_bin_packing_scheduler
+                    bin_packing_scheduler = get_bin_packing_scheduler()
+                    if bin_packing_scheduler is not None:
+                        for replica_id in range(num_replicas):
+                            prompt_ids = bin_packing_scheduler.get_prompts_for_replica(replica_id)
+                            per_replica_prompt_ids[replica_id] = sorted(prompt_ids)  # Sort for readability
+                            
+                            # Record response lengths for each prompt in this replica
+                        replica_prompt_response_lengths = {}
+                        for prompt_id in prompt_ids:
+                            # per_prompt_avg_response_lengths uses integer keys
+                            if prompt_id in per_prompt_avg_response_lengths:
+                                replica_prompt_response_lengths[prompt_id] = per_prompt_avg_response_lengths[prompt_id]
+                        per_replica_prompt_response_lengths[replica_id] = replica_prompt_response_lengths
+                        print(f"[DEBUG] Bin packing prompt assignment: {per_replica_prompt_ids}")
+                elif schedule_mode == "shuffle":
+                    # For shuffle, we need to reconstruct which prompts went to which replica
+                    # Since shuffle reorders prompts, and then dispatch uses chunk, we need to:
+                    # 1. Get the shuffled indices from scheduler
+                    # 2. Map shuffled positions to original prompt IDs
+                    # 3. Calculate which prompts go to which replica based on chunk size
+                    from verl.utils.shuffle_scheduler import get_shuffle_scheduler
+                    
+                    # Debug: check environment variables again
+                    import os
+                    print(f"[DEBUG] Checking shuffle scheduler:")
+                    print(f"  VERL_ENABLE_SHUFFLE={os.getenv('VERL_ENABLE_SHUFFLE', 'not set')}")
+                    print(f"  VERL_SHUFFLE_SEED={os.getenv('VERL_SHUFFLE_SEED', 'not set')}")
+                    
+                    shuffle_scheduler = get_shuffle_scheduler()
+                    print(f"[DEBUG] Shuffle scheduler result: {shuffle_scheduler}")
+                    
+                    if shuffle_scheduler is not None:
+                        # Get shuffled indices (this gives us the order after shuffle)
+                        # Note: shuffled_indices[i] is the original prompt ID at position i after shuffle
+                        # When actual_n=1 (validation), shuffled_indices[i] is directly the prompt ID
+                        shuffled_indices = shuffle_scheduler.get_shuffled_indices(len(response_lengths), actual_n)
+                        print(f"[DEBUG] Got shuffled_indices, length={len(shuffled_indices)}, first 20: {shuffled_indices[:20]}")
+                        
+                        # Map shuffled positions to original prompt IDs
+                        # shuffled_indices[i] is the original prompt ID at position i after shuffle
+                        # When actual_n=1, shuffled_indices[i] is directly the prompt ID
+                        prompts_per_replica = len(response_lengths) // num_replicas
+                        print(f"[DEBUG] Prompts per replica: {prompts_per_replica}, num_replicas: {num_replicas}")
+                        
+                        for replica_id in range(num_replicas):
+                            start_pos = replica_id * prompts_per_replica
+                            end_pos = (replica_id + 1) * prompts_per_replica if replica_id < num_replicas - 1 else len(shuffled_indices)
+                            
+                            # Get the shuffled indices for this replica's positions
+                            replica_shuffled_indices = shuffled_indices[start_pos:end_pos]
+                            
+                            # Convert to original prompt IDs
+                            # When actual_n=1, shuffled_indices[i] is directly the prompt ID
+                            replica_prompt_ids = set()
+                            for shuffled_idx in replica_shuffled_indices:
+                                # When actual_n=1, shuffled_idx is the prompt ID
+                                # When actual_n>1, we need to convert: shuffled_idx // actual_n
+                                if actual_n == 1:
+                                    original_prompt_id = shuffled_idx
+                                else:
+                                    original_prompt_id = shuffled_idx // actual_n
+                                replica_prompt_ids.add(original_prompt_id)
+                            
+                            per_replica_prompt_ids[replica_id] = sorted(replica_prompt_ids)
+                            
+                            # Record response lengths for each prompt in this replica
+                            replica_prompt_response_lengths = {}
+                            for prompt_id in replica_prompt_ids:
+                                # per_prompt_avg_response_lengths uses integer keys
+                                if prompt_id in per_prompt_avg_response_lengths:
+                                    replica_prompt_response_lengths[prompt_id] = per_prompt_avg_response_lengths[prompt_id]
+                                else:
+                                    # Debug: log missing prompt IDs
+                                    print(f"[DEBUG] Prompt ID {prompt_id} not found in per_prompt_avg_response_lengths")
+                            per_replica_prompt_response_lengths[replica_id] = replica_prompt_response_lengths
+                        print(f"[DEBUG] Shuffle prompt assignment: {per_replica_prompt_ids}")
+                        print(f"[DEBUG] Shuffle response lengths recorded: {sum(len(v) for v in per_replica_prompt_response_lengths.values())} prompts")
+                    else:
+                        print(f"[DEBUG] Shuffle scheduler is None, cannot record prompt assignment - falling back to default")
+                        # Fallback to default sequential assignment
+                        prompts_per_replica = num_original_prompts // num_replicas
+                        for replica_id in range(num_replicas):
+                            start_prompt = replica_id * prompts_per_replica
+                            end_prompt = (replica_id + 1) * prompts_per_replica if replica_id < num_replicas - 1 else num_original_prompts
+                            per_replica_prompt_ids[replica_id] = list(range(start_prompt, end_prompt))
+                            
+                            replica_prompt_response_lengths = {}
+                            for prompt_id in range(start_prompt, end_prompt):
+                                # per_prompt_avg_response_lengths uses integer keys
+                                if prompt_id in per_prompt_avg_response_lengths:
+                                    replica_prompt_response_lengths[prompt_id] = per_prompt_avg_response_lengths[prompt_id]
+                            per_replica_prompt_response_lengths[replica_id] = replica_prompt_response_lengths
+                else:
+                    # Default: sequential assignment (chunk)
+                    prompts_per_replica = num_original_prompts // num_replicas
+                    for replica_id in range(num_replicas):
+                        start_prompt = replica_id * prompts_per_replica
+                        end_prompt = (replica_id + 1) * prompts_per_replica if replica_id < num_replicas - 1 else num_original_prompts
+                        per_replica_prompt_ids[replica_id] = list(range(start_prompt, end_prompt))
+                        
+                        # Record response lengths for each prompt in this replica
+                        replica_prompt_response_lengths = {}
+                        for prompt_id in range(start_prompt, end_prompt):
+                            # per_prompt_avg_response_lengths uses integer keys
+                            if prompt_id in per_prompt_avg_response_lengths:
+                                replica_prompt_response_lengths[prompt_id] = per_prompt_avg_response_lengths[prompt_id]
+                        per_replica_prompt_response_lengths[replica_id] = replica_prompt_response_lengths
+                    print(f"[DEBUG] Default prompt assignment (sequential chunk): {per_replica_prompt_ids}")
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to record per-replica prompt assignment: {e}")
+                # Fallback: sequential assignment
+                prompts_per_replica = num_original_prompts // num_replicas
+                for replica_id in range(num_replicas):
+                    start_prompt = replica_id * prompts_per_replica
+                    end_prompt = (replica_id + 1) * prompts_per_replica if replica_id < num_replicas - 1 else num_original_prompts
+                    per_replica_prompt_ids[replica_id] = list(range(start_prompt, end_prompt))
+                    
+                    # Record response lengths for each prompt in this replica (fallback)
+                    replica_prompt_response_lengths = {}
+                    for prompt_id in range(start_prompt, end_prompt):
+                        # per_prompt_avg_response_lengths uses integer keys
+                        if prompt_id in per_prompt_avg_response_lengths:
+                            replica_prompt_response_lengths[prompt_id] = per_prompt_avg_response_lengths[prompt_id]
+                    per_replica_prompt_response_lengths[replica_id] = replica_prompt_response_lengths
+            
             # Store per-batch worker timing info
+            per_worker_prompt_ids = {}
+            if per_worker_times:
+                for worker_timing in per_worker_times:
+                    worker_rank = worker_timing.get("worker_rank")
+                    replica_id = worker_timing.get("replica_id")
+                    if worker_rank is None or replica_id is None:
+                        continue
+                    per_worker_prompt_ids[str(worker_rank)] = per_replica_prompt_ids.get(replica_id, [])
+
             batch_worker_timing = {
                 'batch': batch_idx,
                 'avg_time': timing_avg,
@@ -841,6 +1163,10 @@ class RayPPOTrainer:
                 'per_prompt_avg_response_lengths': per_prompt_avg_response_lengths,  # {prompt_id: avg_length} - average response length for each prompt
                 'all_response_lengths': response_lengths,  # All response lengths (flat list, for backward compatibility)
                 'all_prompt_lengths': prompt_lengths,  # All prompt lengths (flat list, for backward compatibility)
+                'per_replica_prompt_ids': per_replica_prompt_ids,  # {replica_id: [prompt_id1, prompt_id2, ...]} - NEW: record which prompts each replica processes
+                'per_replica_prompt_response_lengths': per_replica_prompt_response_lengths,  # {replica_id: {prompt_id: avg_response_length}} - NEW: record response lengths for each prompt in each replica
+                'per_worker_prompt_ids': per_worker_prompt_ids,  # {worker_rank: [prompt_ids]}
+                'schedule_mode': schedule_mode,  # NEW: record the schedule mode used
             }
             self._validation_rollout_metrics['worker_times'].append(batch_worker_timing)
             self._validation_rollout_metrics['all_workers_timing'].append(per_worker_times)
@@ -1455,15 +1781,15 @@ class RayPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
-    def _apply_scheduling(self, gen_batch_output: DataProto) -> DataProto:
+    def _apply_scheduling(self, gen_batch: DataProto) -> DataProto:
         """
         应用调度策略：根据配置选择bin packing、shuffle或默认顺序
         
         Args:
-            gen_batch_output: 经过repeat后的DataProto
+            gen_batch: 未repeat的DataProto（原始prompts）
         
         Returns:
-            调度后的DataProto
+            调度后的DataProto（仍然是原始prompts，未repeat）
         """
         import os
         
@@ -1471,22 +1797,22 @@ class RayPPOTrainer:
         schedule_mode = os.getenv("VERL_SCHEDULE_MODE", "default").lower()
         
         if schedule_mode == "bin_packing":
-            return self._apply_bin_packing_schedule(gen_batch_output)
+            return self._apply_bin_packing_schedule(gen_batch)
         elif schedule_mode == "shuffle":
-            return self._apply_shuffle_schedule(gen_batch_output)
+            return self._apply_shuffle_schedule(gen_batch)
         else:
             # 默认：不进行调度，保持原始顺序
-            return gen_batch_output
+            return gen_batch
     
-    def _apply_shuffle_schedule(self, gen_batch_output: DataProto) -> DataProto:
+    def _apply_shuffle_schedule(self, gen_batch: DataProto) -> DataProto:
         """
-        应用Shuffle调度：完全随机打乱所有prompts
+        应用Shuffle调度：完全随机打乱原始prompts（在repeat之前）
         
         Args:
-            gen_batch_output: 经过repeat后的DataProto（包含所有prompts的n个副本）
+            gen_batch: 未repeat的DataProto（原始prompts）
         
         Returns:
-            随机打乱后的DataProto
+            随机打乱后的DataProto（仍然是原始prompts，未repeat）
         """
         try:
             from verl.utils.shuffle_scheduler import get_shuffle_scheduler
@@ -1494,46 +1820,45 @@ class RayPPOTrainer:
             scheduler = get_shuffle_scheduler()
             if scheduler is None:
                 # 未启用shuffle，返回原数据
-                return gen_batch_output
+                return gen_batch
             
-            # 获取rollout.n
-            rollout_n = getattr(self.config.actor_rollout_ref.rollout, 'n', 1)
-            data_len = len(gen_batch_output)
+            # 获取原始prompts数量
+            num_prompts = len(gen_batch)
             
-            # 获取shuffle后的索引
-            # 选项1：保持同一个prompt的n个副本连续（推荐）
-            shuffled_indices = scheduler.get_shuffled_indices(data_len, rollout_n)
+            # 创建原始prompt的索引列表并打乱
+            original_prompt_indices = list(range(num_prompts))
+            shuffled_prompt_indices = original_prompt_indices.copy()
+            import random
+            if scheduler.seed is not None:
+                random.seed(scheduler.seed)
+            random.shuffle(shuffled_prompt_indices)
             
-            # 选项2：完全随机打乱（包括同一个prompt的多个副本）
-            # shuffled_indices = scheduler.get_shuffled_indices_full(data_len)
-            
-            # 重新排列数据
-            shuffled_data = gen_batch_output.select_idxs(shuffled_indices)
+            # 重新排列数据（只对原始prompts进行shuffle）
+            shuffled_data = gen_batch.select_idxs(shuffled_prompt_indices)
             
             # 在meta_info中记录调度信息
             shuffled_data.meta_info["shuffle_scheduled"] = True
-            shuffled_data.meta_info["rollout_n"] = rollout_n
             if scheduler.seed is not None:
                 shuffled_data.meta_info["shuffle_seed"] = scheduler.seed
             
-            print(f"[Shuffle] Applied scheduling: {data_len} items shuffled (seed={scheduler.seed})")
+            print(f"[Shuffle] Applied scheduling: {num_prompts} prompts shuffled (seed={scheduler.seed})")
             
             return shuffled_data
             
         except Exception as e:
             import warnings
             warnings.warn(f"Failed to apply shuffle schedule: {e}. Using original data order.")
-            return gen_batch_output
+            return gen_batch
 
-    def _apply_bin_packing_schedule(self, gen_batch_output: DataProto) -> DataProto:
+    def _apply_bin_packing_schedule(self, gen_batch: DataProto) -> DataProto:
         """
-        应用Bin Packing调度：根据avg response length重新排列prompts，使得每个replica的负载均衡
+        应用Bin Packing调度：根据avg response length重新排列原始prompts，使得每个replica的负载均衡
         
         Args:
-            gen_batch_output: 经过repeat后的DataProto（包含所有prompts的n个副本）
+            gen_batch: 未repeat的DataProto（原始prompts）
         
         Returns:
-            重新排列后的DataProto，prompts已按照bin packing调度结果重新排序
+            重新排列后的DataProto（仍然是原始prompts，未repeat）
         """
         try:
             from verl.utils.bin_packing_scheduler import get_bin_packing_scheduler
@@ -1541,12 +1866,10 @@ class RayPPOTrainer:
             scheduler = get_bin_packing_scheduler()
             if scheduler is None:
                 # 未配置bin packing调度，返回原数据
-                return gen_batch_output
+                return gen_batch
             
-            # 获取rollout.n
-            rollout_n = getattr(self.config.actor_rollout_ref.rollout, 'n', 1)
-            data_len = len(gen_batch_output)
-            num_original_prompts = data_len // rollout_n if rollout_n > 0 else data_len
+            # 获取原始prompts数量
+            num_prompts = len(gen_batch)
             
             # 获取TP size和replicas数量
             try:
@@ -1559,7 +1882,7 @@ class RayPPOTrainer:
                 num_replicas = num_workers // tp_size if tp_size > 0 else num_workers
             except:
                 # 如果获取失败，返回原数据
-                return gen_batch_output
+                return gen_batch
             
             # 验证replicas数量
             expected_replicas = scheduler.schedule.get('num_replicas', num_replicas)
@@ -1569,48 +1892,42 @@ class RayPPOTrainer:
                     f"Bin packing schedule expects {expected_replicas} replicas, but current setup has {num_replicas} replicas. "
                     f"Skipping bin packing scheduling."
                 )
-                return gen_batch_output
+                return gen_batch
             
-            # 创建重新排列的索引
-            # 目标：将数据重新排列，使得每个replica的prompts（包括所有n个副本）连续
+            # 创建重新排列的索引（只对原始prompts进行重新排列）
             reorder_indices = []
             
             # 按replica顺序收集prompts
             for replica_id in range(num_replicas):
                 prompt_ids = scheduler.get_prompts_for_replica(replica_id)
                 for prompt_id in prompt_ids:
-                    if prompt_id < num_original_prompts:
-                        # 这个prompt的所有n个副本的索引
-                        start_idx = prompt_id * rollout_n
-                        end_idx = start_idx + rollout_n
-                        for idx in range(start_idx, end_idx):
-                            reorder_indices.append(idx)
+                    if prompt_id < num_prompts:
+                        # 直接使用prompt_id作为索引（因为这是原始prompts，未repeat）
+                        reorder_indices.append(prompt_id)
             
             # 验证索引数量
-            if len(reorder_indices) != data_len:
+            if len(reorder_indices) != num_prompts:
                 import warnings
                 warnings.warn(
-                    f"Bin packing reorder indices count ({len(reorder_indices)}) != data length ({data_len}). "
-                    f"num_original_prompts={num_original_prompts}, rollout_n={rollout_n}. "
+                    f"Bin packing reorder indices count ({len(reorder_indices)}) != num prompts ({num_prompts}). "
                     f"Skipping bin packing scheduling."
                 )
-                return gen_batch_output
+                return gen_batch
             
-            # 重新排列数据
-            reordered_data = gen_batch_output.select_idxs(reorder_indices)
+            # 重新排列数据（只对原始prompts重新排列）
+            reordered_data = gen_batch.select_idxs(reorder_indices)
             
             # 在meta_info中记录调度信息
             reordered_data.meta_info["bin_packing_scheduled"] = True
-            reordered_data.meta_info["rollout_n"] = rollout_n
             
-            print(f"[Bin Packing] Applied scheduling: {num_original_prompts} prompts -> {num_replicas} replicas")
+            print(f"[Bin Packing] Applied scheduling: {num_prompts} prompts -> {num_replicas} replicas")
             
             return reordered_data
             
         except Exception as e:
             import warnings
             warnings.warn(f"Failed to apply bin packing schedule: {e}. Using original data order.")
-            return gen_batch_output
+            return gen_batch
 
     def _apply_scheduling_validation(self, test_batch: DataProto) -> DataProto:
         """
@@ -1624,8 +1941,31 @@ class RayPPOTrainer:
         """
         import os
         
-        # 检查调度模式
-        schedule_mode = os.getenv("VERL_SCHEDULE_MODE", "default").lower()
+        # 检查调度模式（同时检查VERL_SCHEDULE_MODE和VERL_ENABLE_SHUFFLE）
+        schedule_mode_check = os.getenv("VERL_SCHEDULE_MODE", "default").lower()
+        shuffle_enabled = os.getenv("VERL_ENABLE_SHUFFLE", "false").lower() in ["true", "1", "yes"]
+        
+        # Determine actual schedule mode
+        if schedule_mode_check == "bin_packing":
+            schedule_mode = "bin_packing"
+        elif schedule_mode_check == "shuffle" or shuffle_enabled:
+            schedule_mode = "shuffle"
+        else:
+            schedule_mode = "default"
+        
+        # Safety check: If shuffle is expected but schedule_mode is still default, raise error
+        expected_shuffle = (schedule_mode_check == "shuffle" or shuffle_enabled)
+        if expected_shuffle and schedule_mode == "default":
+            error_msg = (
+                f"ERROR: Shuffle scheduling was requested but schedule_mode is still 'default'!\n"
+                f"  VERL_SCHEDULE_MODE={os.getenv('VERL_SCHEDULE_MODE', 'not set')}\n"
+                f"  VERL_ENABLE_SHUFFLE={os.getenv('VERL_ENABLE_SHUFFLE', 'not set')}\n"
+                f"  Detected schedule_mode={schedule_mode}\n"
+                f"  This indicates that environment variables are not being passed to Ray workers correctly.\n"
+                f"  Please check that get_ppo_ray_runtime_env() includes these variables in runtime_env."
+            )
+            print(f"[FATAL ERROR] {error_msg}")
+            raise RuntimeError(error_msg)
         
         if schedule_mode == "bin_packing":
             return self._apply_bin_packing_schedule_validation(test_batch)
@@ -1645,11 +1985,18 @@ class RayPPOTrainer:
         Returns:
             随机打乱后的DataProto
         """
+        import os
         try:
             from verl.utils.shuffle_scheduler import get_shuffle_scheduler
             
+            # Debug: check environment variables
+            schedule_mode_check = os.getenv("VERL_SCHEDULE_MODE", "default")
+            shuffle_enabled = os.getenv("VERL_ENABLE_SHUFFLE", "false")
+            print(f"[DEBUG] _apply_shuffle_schedule_validation: VERL_SCHEDULE_MODE={schedule_mode_check}, VERL_ENABLE_SHUFFLE={shuffle_enabled}")
+            
             scheduler = get_shuffle_scheduler()
             if scheduler is None:
+                print(f"[DEBUG] Shuffle scheduler is None, returning original test_batch")
                 return test_batch
             
             # 获取val_kwargs.n（validation时的重复次数，通常是1）
@@ -1662,17 +2009,22 @@ class RayPPOTrainer:
             # 重新排列数据
             shuffled_data = test_batch.select_idxs(shuffled_indices)
             shuffled_data.meta_info["shuffle_scheduled"] = True
+            # Save shuffled_indices in meta_info so we can recover original prompt_id mapping later
+            shuffled_data.meta_info["shuffled_indices"] = shuffled_indices
             
             if scheduler.seed is not None:
                 shuffled_data.meta_info["shuffle_seed"] = scheduler.seed
             
             print(f"[Shuffle Validation] Applied scheduling: {data_len} items shuffled (seed={scheduler.seed})")
+            print(f"[DEBUG] First 10 shuffled indices: {shuffled_indices[:10]}")
             
             return shuffled_data
             
         except Exception as e:
             import warnings
+            import traceback
             warnings.warn(f"Failed to apply shuffle schedule for validation: {e}")
+            print(f"[DEBUG] Exception in _apply_shuffle_schedule_validation: {traceback.format_exc()}")
             return test_batch
 
     def _apply_bin_packing_schedule_validation(self, test_batch: DataProto) -> DataProto:
@@ -1916,12 +2268,19 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                
+                # Apply scheduling BEFORE repeat (prompt-level scheduling)
+                # This ensures we schedule original prompts, not repeated ones
+                gen_batch = self._apply_scheduling(gen_batch)
+                
+                # Repeat after scheduling: each prompt is repeated n times
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-                
-                # Apply scheduling (bin packing, shuffle, or default)
-                gen_batch_output = self._apply_scheduling(gen_batch_output)
+                #对于一个1 2 3 的list，interleave=True的话，会变成1 1 2 2 3 3
+                #那这样就会造成gpu idle
+                #但是如果interleave=False，会变成1 2 3 1 2 3
+                #均匀分布
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):

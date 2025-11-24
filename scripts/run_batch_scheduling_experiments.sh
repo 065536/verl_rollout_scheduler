@@ -22,7 +22,8 @@ mkdir -p "$SCHEDULES_DIR"
 
 # 实验配置
 REPEATS=3  # 每种调度模式重复3次
-SCHEDULE_MODES=("default" "shuffle" "bin_packing")  # 三种调度模式
+#SCHEDULE_MODES=("default" "shuffle" "bin_packing")  # 运行所有三种模式：default -> shuffle -> bin_packing
+SCHEDULE_MODES=("bin_packing")  # 运行所有三种模式：default -> shuffle -> bin_packing
 
 # 创建实验根目录
 EXPERIMENT_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -346,8 +347,8 @@ for schedule_mode in "${SCHEDULE_MODES[@]}"; do
                     # 然后使用Best Fit Decreasing算法生成bin packing调度
                     if python3 "${PROJECT_ROOT}/utils/schedule_prompts.py" \
                         "$DEFAULT_METRICS_FILE" \
-                        --num_replicas "$NUM_REPLICAS" \
-                        --output_file "$SCHEDULE_FILE" 2>&1; then
+                        --num-replicas "$NUM_REPLICAS" \
+                        --output "$SCHEDULE_FILE" 2>&1; then
                         if [ -f "$SCHEDULE_FILE" ]; then
                             export VERL_BIN_PACKING_SCHEDULE_FILE="$SCHEDULE_FILE"
                             echo "✓ Successfully generated bin packing schedule file from default experiment: $SCHEDULE_FILE"
@@ -413,7 +414,7 @@ for schedule_mode in "${SCHEDULE_MODES[@]}"; do
             data.prompt_key=prompt \
             data.truncation='left' \
             data.max_prompt_length=2048 \
-            data.max_response_length=8192 \
+            data.max_response_length=32768 \
             data.train_batch_size=128 \
             actor_rollout_ref.rollout.n=16 \
             actor_rollout_ref.actor.strategy=fsdp \
@@ -425,12 +426,12 @@ for schedule_mode in "${SCHEDULE_MODES[@]}"; do
             actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
             actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
             actor_rollout_ref.rollout.enable_chunked_prefill=True \
-            actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+            actor_rollout_ref.rollout.max_num_batched_tokens=65536 \
             actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
-            actor_rollout_ref.rollout.temperature=1.0 \
+            actor_rollout_ref.rollout.temperature=0.6 \
             actor_rollout_ref.rollout.top_p=1.0 \
             actor_rollout_ref.rollout.top_k=-1 \
-            actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
+            actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
             actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
             actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
             actor_rollout_ref.rollout.val_kwargs.do_sample=True \
