@@ -25,7 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -536,6 +536,14 @@ class RayPPOTrainer:
         return gen_batch
 
     def _validate(self):
+        # DEBUG_BREAKPOINT_RayPPOTrainer._validate
+        import os
+        if os.getenv("VERL_DEBUG", "0") == "1":
+            import ipdb
+            print("\n======================================================================")
+            print(f"🐛 DEBUG BREAKPOINT: RayPPOTrainer._validate")
+            print(f"======================================================================\n")
+            ipdb.set_trace()
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -562,18 +570,6 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
-            # repeat test batch
-            val_kwargs_n = self.config.actor_rollout_ref.rollout.val_kwargs.n
-            print(f"  Before repeat: {len(test_batch)} prompts")
-            print(f"  val_kwargs.n: {val_kwargs_n}")
-            test_batch = test_batch.repeat(
-                repeat_times=val_kwargs_n, interleave=True
-            )
-            print(f"  After repeat: {len(test_batch)} prompts")
-            
-            # Apply scheduling on the validation batch itself so that later unions keep ordering aligned
-            test_batch = self._apply_scheduling_validation(test_batch)
-
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
@@ -592,6 +588,31 @@ class RayPPOTrainer:
 
             # Get generation batch (removes input_ids, attention_mask, position_ids)
             test_gen_batch = self._get_gen_batch(test_batch)
+            
+            # Apply scheduling BEFORE repeat (prompt-level scheduling) - aligned with training phase
+            # This ensures we schedule original prompts, not repeated ones
+            print(f"  Before scheduling: {len(test_gen_batch)} prompts")
+            test_gen_batch = self._apply_scheduling(test_gen_batch)
+            print(f"  After scheduling: {len(test_gen_batch)} prompts")
+            
+            # Repeat after scheduling: each prompt is repeated n times
+            val_kwargs_n = self.config.actor_rollout_ref.rollout.val_kwargs.n
+            print(f"  val_kwargs.n: {val_kwargs_n}")
+            test_gen_batch = test_gen_batch.repeat(
+                repeat_times=val_kwargs_n, interleave=True
+            )
+            print(f"  After repeat: {len(test_gen_batch)} prompts")
+            
+            # Now we need to repeat test_batch as well to align with test_gen_batch
+            # But we need to preserve the original test_batch for later union
+            # So we'll create a repeated version for union later
+            test_batch_repeated = test_batch.repeat(
+                repeat_times=val_kwargs_n, interleave=True
+            )
+            
+            # Get TP size from config to include in meta_info
+            tp_size = getattr(self.config.actor_rollout_ref.rollout, 'tensor_model_parallel_size', 1)
+            
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -599,6 +620,7 @@ class RayPPOTrainer:
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
                 "global_steps": self.global_steps,
+                "tp_size": tp_size,  # Include TP size for bin packing dispatch
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
             # Preserve scheduling metadata if present on the repeated batch
@@ -676,9 +698,6 @@ class RayPPOTrainer:
                 tp_size = 1
             
             # Calculate number of replicas (TP groups)
-            # Note: In VERL, "Replica" is the official term for grouping workers with TP
-            # Each Replica contains world_size workers (world_size = TP × DP × PP)
-            # In our case: TP=2, DP=8, PP=1, so world_size=2, num_replicas=8
             num_replicas = num_workers // tp_size if tp_size > 0 else num_workers
             
             # Calculate total response tokens and record per-prompt response lengths
@@ -692,15 +711,6 @@ class RayPPOTrainer:
             response_lengths = response_info["response_length"].cpu().numpy().tolist()  # List of response lengths for each prompt
             prompt_lengths = response_info["prompt_length"].cpu().numpy().tolist()  # List of prompt lengths for each prompt
             
-            print(f"[DEBUG] Response info:")
-            print(f"  Total response_lengths: {len(response_lengths)}")
-            print(f"  Total prompt_lengths: {len(prompt_lengths)}")
-            
-            # Get the actual n used for validation (val_kwargs.n, not rollout.n)
-            # IMPORTANT: In validation, we use val_kwargs.n, not rollout.n
-            # rollout.n is used for training, but val_kwargs.n is used for validation
-            # Since we already have val_kwargs_n from the repeat step above, use it
-            # If not available, fall back to val_kwargs.n, then rollout.n
             if 'val_kwargs_n' in locals():
                 actual_n = val_kwargs_n
             else:
@@ -750,7 +760,6 @@ class RayPPOTrainer:
                         avg_length = sum(prompt_response_lengths) / len(prompt_response_lengths)
                         per_prompt_avg_response_lengths[prompt_id] = avg_length
                 
-                print(f"[DEBUG] Recovered {len(per_prompt_avg_response_lengths)} prompts from shuffled data")
             else:
                 # Original order: [Prompt 0 (gen 1), Prompt 0 (gen 2), ..., Prompt 0 (gen n), Prompt 1 (gen 1), ...]
                 num_original_prompts = len(response_lengths) // actual_n if actual_n > 0 else len(response_lengths)
@@ -920,6 +929,35 @@ class RayPPOTrainer:
                         per_worker_tokens_calculated = True
                         print(f"[DEBUG] Calculated per-worker tokens based on shuffle schedule")
                 
+                # For default mode, use sequential assignment
+                elif actual_schedule_mode == "default":
+                    # Default: sequential assignment (each replica gets num_original_prompts / num_replicas prompts)
+                    prompts_per_replica = num_original_prompts // num_replicas
+                    remainder = num_original_prompts % num_replicas
+                    
+                    prompt_idx = 0
+                    for replica_id in range(num_replicas):
+                        # Calculate how many prompts this replica should get
+                        num_prompts = prompts_per_replica + (1 if replica_id < remainder else 0)
+                        replica_tokens = 0
+                        for _ in range(num_prompts):
+                            if prompt_idx < num_original_prompts:
+                                # Sum all n generations for this prompt
+                                if prompt_idx in per_prompt_response_lengths:
+                                    replica_tokens += sum(per_prompt_response_lengths[prompt_idx])
+                                prompt_idx += 1
+                        per_replica_tokens[replica_id] = replica_tokens
+                    
+                    # Distribute replica tokens to workers
+                    for worker_data in per_worker_times:
+                        replica_id = worker_data['replica_id']
+                        if replica_id in per_replica_tokens:
+                            worker_data['response_tokens'] = int(per_replica_tokens[replica_id])
+                        else:
+                            worker_data['response_tokens'] = int(total_response_tokens / num_workers)
+                    per_worker_tokens_calculated = True
+                    print(f"[DEBUG] Calculated per-worker tokens based on sequential assignment (default mode)")
+                
             except Exception as e:
                 import warnings
                 warnings.warn(f"Failed to calculate per-worker tokens from scheduler: {e}")
@@ -931,10 +969,6 @@ class RayPPOTrainer:
                     worker_data['response_tokens'] = int(tokens_per_worker)
                 print(f"[DEBUG] Using average token distribution (scheduler not available or failed)")
             
-            # Note: We don't track per-replica statistics because we cannot directly measure
-            # each replica's individual completion time. All replicas execute in parallel,
-            # and we only have access to the overall wall clock time (all replicas combined).
-            # The overall_wall_clock_time represents the time from start to finish for all replicas.
             
             # Store metrics for later aggregation
             if not hasattr(self, '_validation_rollout_metrics'):
@@ -965,8 +999,6 @@ class RayPPOTrainer:
             self._validation_rollout_metrics['total_prompt_tokens'] += total_prompt_tokens
             self._validation_rollout_metrics['num_batches'] += 1
             
-            # Record per-replica prompt assignment (for verification)
-            # This helps verify that scheduling (bin_packing/shuffle) is actually working
             per_replica_prompt_ids = {}
             per_replica_prompt_response_lengths = {}  # NEW: record response lengths for each prompt in each replica
             import os
@@ -1022,11 +1054,6 @@ class RayPPOTrainer:
                         per_replica_prompt_response_lengths[replica_id] = replica_prompt_response_lengths
                         print(f"[DEBUG] Bin packing prompt assignment: {per_replica_prompt_ids}")
                 elif schedule_mode == "shuffle":
-                    # For shuffle, we need to reconstruct which prompts went to which replica
-                    # Since shuffle reorders prompts, and then dispatch uses chunk, we need to:
-                    # 1. Get the shuffled indices from scheduler
-                    # 2. Map shuffled positions to original prompt IDs
-                    # 3. Calculate which prompts go to which replica based on chunk size
                     from verl.utils.shuffle_scheduler import get_shuffle_scheduler
                     
                     # Debug: check environment variables again
@@ -1039,15 +1066,9 @@ class RayPPOTrainer:
                     print(f"[DEBUG] Shuffle scheduler result: {shuffle_scheduler}")
                     
                     if shuffle_scheduler is not None:
-                        # Get shuffled indices (this gives us the order after shuffle)
-                        # Note: shuffled_indices[i] is the original prompt ID at position i after shuffle
-                        # When actual_n=1 (validation), shuffled_indices[i] is directly the prompt ID
                         shuffled_indices = shuffle_scheduler.get_shuffled_indices(len(response_lengths), actual_n)
                         print(f"[DEBUG] Got shuffled_indices, length={len(shuffled_indices)}, first 20: {shuffled_indices[:20]}")
                         
-                        # Map shuffled positions to original prompt IDs
-                        # shuffled_indices[i] is the original prompt ID at position i after shuffle
-                        # When actual_n=1, shuffled_indices[i] is directly the prompt ID
                         prompts_per_replica = len(response_lengths) // num_replicas
                         print(f"[DEBUG] Prompts per replica: {prompts_per_replica}, num_replicas: {num_replicas}")
                         
@@ -1143,6 +1164,45 @@ class RayPPOTrainer:
                         continue
                     per_worker_prompt_ids[str(worker_rank)] = per_replica_prompt_ids.get(replica_id, [])
 
+            # Build helper mappings for per-prompt timing attribution
+            replica_times = {}
+            replica_worker_ranks: dict[int, list[int]] = defaultdict(list)
+            for worker_timing in per_worker_times:
+                replica_id = worker_timing.get("replica_id")
+                if replica_id is None:
+                    continue
+                worker_time = worker_timing.get("rollout_time", 0.0)
+                replica_times[replica_id] = max(replica_times.get(replica_id, 0.0), worker_time)
+                if "worker_rank" in worker_timing and worker_timing["worker_rank"] is not None:
+                    replica_worker_ranks[replica_id].append(worker_timing["worker_rank"])
+            
+            prompt_to_replica: dict[int, int] = {}
+            for replica_id, prompt_ids in per_replica_prompt_ids.items():
+                for prompt_id in prompt_ids:
+                    prompt_to_replica[prompt_id] = replica_id
+            
+            per_prompt_generation_stats: dict[int, dict[str, Any]] = {}
+            for prompt_id, response_lengths_list in per_prompt_response_lengths.items():
+                total_resp_tokens = int(sum(response_lengths_list))
+                num_generations_for_prompt = len(response_lengths_list)
+                avg_resp_tokens = (
+                    float(total_resp_tokens / num_generations_for_prompt)
+                    if num_generations_for_prompt > 0
+                    else 0.0
+                )
+                replica_id = prompt_to_replica.get(prompt_id)
+                per_prompt_generation_stats[prompt_id] = {
+                    "prompt_length": per_prompt_prompt_lengths.get(prompt_id, 0),
+                    "response_lengths": response_lengths_list,
+                    "total_response_tokens": total_resp_tokens,
+                    "avg_response_tokens": avg_resp_tokens,
+                    "num_generations": num_generations_for_prompt,
+                    "replica_id": replica_id,
+                    "replica_time_s": replica_times.get(replica_id),
+                    "worker_ranks": replica_worker_ranks.get(replica_id, []),
+                    "schedule_mode": schedule_mode,
+                }
+            
             batch_worker_timing = {
                 'batch': batch_idx,
                 'avg_time': timing_avg,
@@ -1167,6 +1227,7 @@ class RayPPOTrainer:
                 'per_replica_prompt_response_lengths': per_replica_prompt_response_lengths,  # {replica_id: {prompt_id: avg_response_length}} - NEW: record response lengths for each prompt in each replica
                 'per_worker_prompt_ids': per_worker_prompt_ids,  # {worker_rank: [prompt_ids]}
                 'schedule_mode': schedule_mode,  # NEW: record the schedule mode used
+                'per_prompt_generation_stats': per_prompt_generation_stats,  # {prompt_id: {...}} - detailed per-prompt totals & timing attribution
             }
             self._validation_rollout_metrics['worker_times'].append(batch_worker_timing)
             self._validation_rollout_metrics['all_workers_timing'].append(per_worker_times)
@@ -1354,6 +1415,7 @@ class RayPPOTrainer:
             all_per_prompt_response_lengths_dict = {}  # {prompt_id: [all n generations across batches]}
             all_per_prompt_prompt_lengths_dict = {}  # {prompt_id: prompt_length}
             all_per_prompt_avg_response_lengths_dict = {}  # {prompt_id: avg_length}
+            all_per_prompt_generation_summary = {}  # {prompt_id: detailed stats incl. timing}
             all_response_lengths_flat = []  # Flat list for statistics
             all_prompt_lengths_flat = []  # Flat list for statistics
             
@@ -1363,6 +1425,7 @@ class RayPPOTrainer:
                 batch_per_prompt_response_lengths = batch_metrics.get('per_prompt_response_lengths', {})
                 batch_per_prompt_prompt_lengths = batch_metrics.get('per_prompt_prompt_lengths', {})
                 batch_per_prompt_avg_response_lengths = batch_metrics.get('per_prompt_avg_response_lengths', {})
+                batch_per_prompt_generation_stats = batch_metrics.get('per_prompt_generation_stats', {})
                 
                 # Process each prompt in this batch
                 for local_prompt_id in sorted(batch_per_prompt_response_lengths.keys()):
@@ -1374,6 +1437,26 @@ class RayPPOTrainer:
                     all_per_prompt_response_lengths_dict[global_prompt_id] = prompt_response_lengths
                     all_per_prompt_prompt_lengths_dict[global_prompt_id] = prompt_length
                     all_per_prompt_avg_response_lengths_dict[global_prompt_id] = prompt_avg_length
+                    
+                    per_prompt_stats = batch_per_prompt_generation_stats.get(local_prompt_id, {})
+                    all_per_prompt_generation_summary[global_prompt_id] = {
+                        'global_prompt_id': global_prompt_id,
+                        'batch_idx': batch_metrics.get('batch'),
+                        'local_prompt_id': local_prompt_id,
+                        'prompt_length': per_prompt_stats.get('prompt_length', prompt_length),
+                        'response_lengths': per_prompt_stats.get('response_lengths', prompt_response_lengths),
+                        'total_response_tokens': int(
+                            per_prompt_stats.get('total_response_tokens', sum(prompt_response_lengths))
+                        ),
+                        'avg_response_tokens': float(
+                            per_prompt_stats.get('avg_response_tokens', prompt_avg_length)
+                        ),
+                        'num_generations': per_prompt_stats.get('num_generations', len(prompt_response_lengths)),
+                        'replica_id': per_prompt_stats.get('replica_id'),
+                        'replica_time_s': per_prompt_stats.get('replica_time_s'),
+                        'worker_ranks': per_prompt_stats.get('worker_ranks', []),
+                        'schedule_mode': per_prompt_stats.get('schedule_mode', batch_metrics.get('schedule_mode')),
+                    }
                     
                     # Add to flat lists for statistics
                     all_response_lengths_flat.extend(prompt_response_lengths)
@@ -1492,6 +1575,7 @@ class RayPPOTrainer:
                     'all_per_prompt_response_lengths': all_per_prompt_response_lengths_dict,  # {prompt_id: [all n generations]} - grouped by prompt ID
                     'all_per_prompt_avg_response_lengths': all_per_prompt_avg_response_lengths_dict,  # {prompt_id: avg_length} - average response length for each prompt (key for scheduling)
                     'all_per_prompt_prompt_lengths': all_per_prompt_prompt_lengths_dict,  # {prompt_id: prompt_length}
+                    'all_per_prompt_generation_summary': all_per_prompt_generation_summary,  # Detailed per-prompt stats (tokens + replica timing)
                 }, f, indent=2)
             print(f"\nSaved metrics to: {worker_metrics_file}")
             print(f"  - Overall wall clock time (all replicas combined)")
@@ -1791,6 +1875,14 @@ class RayPPOTrainer:
         Returns:
             调度后的DataProto（仍然是原始prompts，未repeat）
         """
+        # DEBUG_BREAKPOINT_RayPPOTrainer._apply_scheduling
+        import os
+        if os.getenv("VERL_DEBUG", "0") == "1":
+            import ipdb
+            print("\n======================================================================")
+            print(f"🐛 DEBUG BREAKPOINT: RayPPOTrainer._apply_scheduling")
+            print(f"======================================================================\n")
+            ipdb.set_trace()
         import os
         
         # 检查调度模式
@@ -1805,50 +1897,16 @@ class RayPPOTrainer:
             return gen_batch
     
     def _apply_shuffle_schedule(self, gen_batch: DataProto) -> DataProto:
-        """
-        应用Shuffle调度：完全随机打乱原始prompts（在repeat之前）
-        
-        Args:
-            gen_batch: 未repeat的DataProto（原始prompts）
-        
-        Returns:
-            随机打乱后的DataProto（仍然是原始prompts，未repeat）
-        """
-        try:
-            from verl.utils.shuffle_scheduler import get_shuffle_scheduler
-            
-            scheduler = get_shuffle_scheduler()
-            if scheduler is None:
-                # 未启用shuffle，返回原数据
-                return gen_batch
-            
-            # 获取原始prompts数量
-            num_prompts = len(gen_batch)
-            
-            # 创建原始prompt的索引列表并打乱
-            original_prompt_indices = list(range(num_prompts))
-            shuffled_prompt_indices = original_prompt_indices.copy()
-            import random
-            if scheduler.seed is not None:
-                random.seed(scheduler.seed)
-            random.shuffle(shuffled_prompt_indices)
-            
-            # 重新排列数据（只对原始prompts进行shuffle）
-            shuffled_data = gen_batch.select_idxs(shuffled_prompt_indices)
-            
-            # 在meta_info中记录调度信息
-            shuffled_data.meta_info["shuffle_scheduled"] = True
-            if scheduler.seed is not None:
-                shuffled_data.meta_info["shuffle_seed"] = scheduler.seed
-            
-            print(f"[Shuffle] Applied scheduling: {num_prompts} prompts shuffled (seed={scheduler.seed})")
-            
-            return shuffled_data
-            
-        except Exception as e:
-            import warnings
-            warnings.warn(f"Failed to apply shuffle schedule: {e}. Using original data order.")
+        from verl.utils.shuffle_scheduler import get_shuffle_scheduler
+        scheduler = get_shuffle_scheduler()
+        if scheduler is None:
             return gen_batch
+        shuffled_indices = scheduler.get_shuffled_prompt_indices(len(gen_batch))
+        shuffled_data = gen_batch.select_idxs(shuffled_indices)
+        shuffled_data.meta_info["shuffle_scheduled"] = True
+        if scheduler.seed is not None:
+            shuffled_data.meta_info["shuffle_seed"] = scheduler.seed
+        return shuffled_data
 
     def _apply_bin_packing_schedule(self, gen_batch: DataProto) -> DataProto:
         """
@@ -1928,174 +1986,6 @@ class RayPPOTrainer:
             import warnings
             warnings.warn(f"Failed to apply bin packing schedule: {e}. Using original data order.")
             return gen_batch
-
-    def _apply_scheduling_validation(self, test_batch: DataProto) -> DataProto:
-        """
-        应用调度策略到validation数据：根据配置选择bin packing、shuffle或默认顺序
-        
-        Args:
-            test_batch: 经过repeat后的DataProto（validation时n=1，所以每个prompt只有1个副本）
-        
-        Returns:
-            调度后的DataProto
-        """
-        import os
-        
-        # 检查调度模式（同时检查VERL_SCHEDULE_MODE和VERL_ENABLE_SHUFFLE）
-        schedule_mode_check = os.getenv("VERL_SCHEDULE_MODE", "default").lower()
-        shuffle_enabled = os.getenv("VERL_ENABLE_SHUFFLE", "false").lower() in ["true", "1", "yes"]
-        
-        # Determine actual schedule mode
-        if schedule_mode_check == "bin_packing":
-            schedule_mode = "bin_packing"
-        elif schedule_mode_check == "shuffle" or shuffle_enabled:
-            schedule_mode = "shuffle"
-        else:
-            schedule_mode = "default"
-        
-        # Safety check: If shuffle is expected but schedule_mode is still default, raise error
-        expected_shuffle = (schedule_mode_check == "shuffle" or shuffle_enabled)
-        if expected_shuffle and schedule_mode == "default":
-            error_msg = (
-                f"ERROR: Shuffle scheduling was requested but schedule_mode is still 'default'!\n"
-                f"  VERL_SCHEDULE_MODE={os.getenv('VERL_SCHEDULE_MODE', 'not set')}\n"
-                f"  VERL_ENABLE_SHUFFLE={os.getenv('VERL_ENABLE_SHUFFLE', 'not set')}\n"
-                f"  Detected schedule_mode={schedule_mode}\n"
-                f"  This indicates that environment variables are not being passed to Ray workers correctly.\n"
-                f"  Please check that get_ppo_ray_runtime_env() includes these variables in runtime_env."
-            )
-            print(f"[FATAL ERROR] {error_msg}")
-            raise RuntimeError(error_msg)
-        
-        if schedule_mode == "bin_packing":
-            return self._apply_bin_packing_schedule_validation(test_batch)
-        elif schedule_mode == "shuffle":
-            return self._apply_shuffle_schedule_validation(test_batch)
-        else:
-            # 默认：不进行调度，保持原始顺序
-            return test_batch
-    
-    def _apply_shuffle_schedule_validation(self, test_batch: DataProto) -> DataProto:
-        """
-        应用Shuffle调度到validation数据
-        
-        Args:
-            test_batch: 经过repeat后的DataProto（validation时n=1）
-        
-        Returns:
-            随机打乱后的DataProto
-        """
-        import os
-        try:
-            from verl.utils.shuffle_scheduler import get_shuffle_scheduler
-            
-            # Debug: check environment variables
-            schedule_mode_check = os.getenv("VERL_SCHEDULE_MODE", "default")
-            shuffle_enabled = os.getenv("VERL_ENABLE_SHUFFLE", "false")
-            print(f"[DEBUG] _apply_shuffle_schedule_validation: VERL_SCHEDULE_MODE={schedule_mode_check}, VERL_ENABLE_SHUFFLE={shuffle_enabled}")
-            
-            scheduler = get_shuffle_scheduler()
-            if scheduler is None:
-                print(f"[DEBUG] Shuffle scheduler is None, returning original test_batch")
-                return test_batch
-            
-            # 获取val_kwargs.n（validation时的重复次数，通常是1）
-            val_kwargs_n = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, 'n', 1)
-            data_len = len(test_batch)
-            
-            # 获取shuffle后的索引
-            shuffled_indices = scheduler.get_shuffled_indices(data_len, val_kwargs_n)
-            
-            # 重新排列数据
-            shuffled_data = test_batch.select_idxs(shuffled_indices)
-            shuffled_data.meta_info["shuffle_scheduled"] = True
-            # Save shuffled_indices in meta_info so we can recover original prompt_id mapping later
-            shuffled_data.meta_info["shuffled_indices"] = shuffled_indices
-            
-            if scheduler.seed is not None:
-                shuffled_data.meta_info["shuffle_seed"] = scheduler.seed
-            
-            print(f"[Shuffle Validation] Applied scheduling: {data_len} items shuffled (seed={scheduler.seed})")
-            print(f"[DEBUG] First 10 shuffled indices: {shuffled_indices[:10]}")
-            
-            return shuffled_data
-            
-        except Exception as e:
-            import warnings
-            import traceback
-            warnings.warn(f"Failed to apply shuffle schedule for validation: {e}")
-            print(f"[DEBUG] Exception in _apply_shuffle_schedule_validation: {traceback.format_exc()}")
-            return test_batch
-
-    def _apply_bin_packing_schedule_validation(self, test_batch: DataProto) -> DataProto:
-        """
-        应用Bin Packing调度到validation数据（val_kwargs.n=1的情况）
-        
-        Args:
-            test_batch: 经过repeat后的DataProto（validation时n=1，所以每个prompt只有1个副本）
-        
-        Returns:
-            重新排列后的DataProto
-        """
-        try:
-            from verl.utils.bin_packing_scheduler import get_bin_packing_scheduler
-            
-            scheduler = get_bin_packing_scheduler()
-            if scheduler is None:
-                return test_batch
-            
-            # 获取val_kwargs.n（validation时的重复次数，通常是1）
-            val_kwargs_n = getattr(self.config.actor_rollout_ref.rollout.val_kwargs, 'n', 1)
-            data_len = len(test_batch)
-            num_original_prompts = data_len // val_kwargs_n if val_kwargs_n > 0 else data_len
-            
-            # 获取TP size和replicas数量
-            try:
-                if not self.async_rollout_mode:
-                    num_workers = self.actor_rollout_wg.world_size
-                else:
-                    num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers if hasattr(self.config.actor_rollout_ref.rollout.agent, 'num_workers') else 1
-                
-                tp_size = getattr(self.config.actor_rollout_ref.rollout, 'tensor_model_parallel_size', 1)
-                num_replicas = num_workers // tp_size if tp_size > 0 else num_workers
-            except:
-                return test_batch
-            
-            # 验证replicas数量
-            expected_replicas = scheduler.schedule.get('num_replicas', num_replicas)
-            if expected_replicas != num_replicas:
-                return test_batch
-            
-            # 创建重新排列的索引
-            reorder_indices = []
-            
-            # 按replica顺序收集prompts
-            for replica_id in range(num_replicas):
-                prompt_ids = scheduler.get_prompts_for_replica(replica_id)
-                for prompt_id in prompt_ids:
-                    if prompt_id < num_original_prompts:
-                        # 这个prompt的所有n个副本的索引
-                        start_idx = prompt_id * val_kwargs_n
-                        end_idx = start_idx + val_kwargs_n
-                        for idx in range(start_idx, end_idx):
-                            reorder_indices.append(idx)
-            
-            # 验证索引数量
-            if len(reorder_indices) != data_len:
-                return test_batch
-            
-            # 重新排列数据
-            reordered_data = test_batch.select_idxs(reorder_indices)
-            reordered_data.meta_info["bin_packing_scheduled"] = True
-            
-            print(f"[Bin Packing Validation] Applied scheduling: {num_original_prompts} prompts -> {num_replicas} replicas")
-            
-            return reordered_data
-            
-        except Exception as e:
-            import warnings
-            warnings.warn(f"Failed to apply bin packing schedule for validation: {e}")
-            return test_batch
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -2200,6 +2090,14 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        # DEBUG_BREAKPOINT_RayPPOTrainer.fit
+        import os
+        if os.getenv("VERL_DEBUG", "0") == "1":
+            import ipdb
+            print("\n======================================================================")
+            print(f"🐛 DEBUG BREAKPOINT: RayPPOTrainer.fit")
+            print(f"======================================================================\n")
+            ipdb.set_trace()
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -2259,32 +2157,28 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
                 gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                
-                # Apply scheduling BEFORE repeat (prompt-level scheduling)
-                # This ensures we schedule original prompts, not repeated ones
                 gen_batch = self._apply_scheduling(gen_batch)
+                # DEBUG_BREAKPOINT_fit_after_scheduling
+                import os
+                if os.getenv("VERL_DEBUG", "0") == "1":
+                    import ipdb
+                    print("\n======================================================================")
+                    print(f"🐛 DEBUG BREAKPOINT: fit_after_scheduling")
+                    print(f"======================================================================\n")
+                    ipdb.set_trace()
                 
-                # Repeat after scheduling: each prompt is repeated n times
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-                #对于一个1 2 3 的list，interleave=True的话，会变成1 1 2 2 3 3
-                #那这样就会造成gpu idle
-                #但是如果interleave=False，会变成1 2 3 1 2 3
-                #均匀分布
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)

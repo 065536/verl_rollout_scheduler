@@ -41,52 +41,44 @@ class ShuffleScheduler:
         if seed is not None:
             random.seed(seed)
     
+    def get_shuffled_prompt_indices(self, num_prompts: int) -> list[int]:
+        """
+        获取shuffle后的原始prompt索引（用于repeat之前）
+        
+        Args:
+            num_prompts: 原始prompts数量（未repeat）
+        
+        Returns:
+            List of shuffled prompt indices [0, 1, 2, ...] -> [shuffled order]
+        """
+        prompt_indices = list(range(num_prompts))
+        random.shuffle(prompt_indices)
+        return prompt_indices
+    
     def get_shuffled_indices(self, data_len: int, rollout_n: int) -> list[int]:
         """
-        获取shuffle后的索引
+        获取shuffle后的索引（用于repeat之后，计算replica分配）
         
         Args:
             data_len: 总数据长度（repeat后的长度）
             rollout_n: 每个prompt的重复次数
         
         Returns:
-            List of shuffled indices
+            List of shuffled indices (repeat后的索引)
         """
         num_original_prompts = data_len // rollout_n if rollout_n > 0 else data_len
         
-        # 创建原始prompt的索引列表
-        original_prompt_indices = list(range(num_original_prompts))
+        shuffled_prompt_indices = self.get_shuffled_prompt_indices(num_original_prompts)
         
-        # 随机打乱原始prompt索引
-        shuffled_prompt_indices = original_prompt_indices.copy()
-        random.shuffle(shuffled_prompt_indices)
-        
-        # 为每个prompt创建所有n个副本的索引
         shuffled_indices = []
         for prompt_id in shuffled_prompt_indices:
             start_idx = prompt_id * rollout_n
             end_idx = start_idx + rollout_n
-            # 保持同一个prompt的n个副本连续
             for idx in range(start_idx, end_idx):
                 shuffled_indices.append(idx)
         
         return shuffled_indices
     
-    def get_shuffled_indices_full(self, data_len: int) -> list[int]:
-        """
-        完全随机打乱所有数据（包括同一个prompt的多个副本）
-        
-        Args:
-            data_len: 总数据长度
-        
-        Returns:
-            List of fully shuffled indices
-        """
-        indices = list(range(data_len))
-        random.shuffle(indices)
-        return indices
-
-
 def get_shuffle_scheduler() -> Optional[ShuffleScheduler]:
     """
     获取shuffle调度器（如果配置了）

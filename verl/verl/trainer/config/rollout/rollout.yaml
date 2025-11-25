@@ -7,6 +7,9 @@ name: ???
 # sync: LLM, async: AsyncLLM
 mode: sync
 
+# Optional random seed passed to rollout engine (e.g., vLLM)
+seed: null
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

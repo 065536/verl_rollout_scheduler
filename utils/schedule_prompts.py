@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bin Packing调度算法
-将prompts根据(prompt_len + avg_response_len)的估计总tokens分配到replicas，实现负载均衡
+将prompts根据avg_response_len（仅考虑response length，不考虑prompt length）分配到replicas，实现负载均衡
 """
 
 import json
@@ -16,7 +16,7 @@ def best_fit_decreasing(items: List[Tuple[int, float]], num_bins: int) -> Tuple[
     Best Fit Decreasing算法：将items分配到bins中，使得负载最均衡
     
     Args:
-        items: List of (prompt_id, weight) tuples, where weight是估计的prompt+response总tokens
+        items: List of (prompt_id, weight) tuples, where weight是估计的response tokens（不考虑prompt length）
         num_bins: Number of bins (replicas)
     
     Returns:
@@ -81,23 +81,28 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
     for pid_str, avg_resp_len in sorted(avg_lengths.items(), key=lambda x: int(x[0])):
         prompt_len = float(prompt_lengths.get(pid_str, 0.0))
         avg_resp_len = float(avg_resp_len)
-        total_len = prompt_len + avg_resp_len
+        # 只使用response length进行bin packing，不考虑prompt length
+        weight = avg_resp_len  # 只使用response length作为权重
         
         pid = int(pid_str)
-        items.append((pid, total_len))
+        items.append((pid, weight))
         prompt_stats[pid] = {
             'prompt_length': prompt_len,
             'avg_response_length': avg_resp_len,
-            'estimated_total_tokens': total_len,
+            'estimated_total_tokens': prompt_len + avg_resp_len,  # 保留总tokens用于统计
+            'bin_packing_weight': weight,  # bin packing使用的权重（仅response length）
         }
         total_prompt_tokens += prompt_len
         total_response_tokens += avg_resp_len
     
+    # 理想情况下每个replica的response tokens（用于bin packing目标）
+    ideal_response_tokens_per_replica = total_response_tokens / num_replicas
+    # 总tokens（用于统计显示）
     total_tokens = total_prompt_tokens + total_response_tokens
     ideal_tokens_per_replica = total_tokens / num_replicas
     
     print("=" * 70)
-    print("Bin Packing调度算法")
+    print("Bin Packing调度算法（仅基于Response Length）")
     print("=" * 70)
     print(f"\n【输入数据】")
     print(f"Prompts数量: {len(items)}")
@@ -105,16 +110,20 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
     print(f"总prompt tokens: {total_prompt_tokens:.0f}")
     print(f"总response tokens: {total_response_tokens:.0f}")
     print(f"估计总tokens(prompt+response): {total_tokens:.0f}")
-    print(f"理想平均每个replica: {ideal_tokens_per_replica:.0f} tokens")
+    print(f"\n【Bin Packing策略】")
+    print(f"  调度权重: 仅使用response length（不考虑prompt length）")
+    print(f"  理想平均每个replica的response tokens: {ideal_response_tokens_per_replica:.0f}")
+    print(f"  理想平均每个replica的总tokens: {ideal_tokens_per_replica:.0f}")
     
     # 执行调度
     bins, bin_sums = best_fit_decreasing(items, num_replicas)
     
     print(f"\n【调度结果】")
     for i, (bin_items, bin_sum) in enumerate(zip(bins, bin_sums)):
-        deviation = bin_sum - ideal_tokens_per_replica
-        deviation_pct = (deviation / ideal_tokens_per_replica) * 100 if ideal_tokens_per_replica > 0 else 0
-        print(f"  Replica {i}: {len(bin_items)} prompts, {bin_sum:.0f} tokens "
+        # bin_sum是基于response tokens的
+        deviation = bin_sum - ideal_response_tokens_per_replica
+        deviation_pct = (deviation / ideal_response_tokens_per_replica) * 100 if ideal_response_tokens_per_replica > 0 else 0
+        print(f"  Replica {i}: {len(bin_items)} prompts, {bin_sum:.0f} response tokens "
               f"(偏差: {deviation:+.0f}, {deviation_pct:+.2f}%)")
     
     print(f"\n【负载均衡统计】")
@@ -128,13 +137,14 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
     
     # 构建调度结果
     schedule_result = {
-        'algorithm': 'Best Fit Decreasing',
+        'algorithm': 'Best Fit Decreasing (Response Length Only)',
         'num_replicas': num_replicas,
         'num_prompts': len(items),
         'total_tokens': total_tokens,
-        'ideal_tokens_per_replica': ideal_tokens_per_replica,
         'total_prompt_tokens': total_prompt_tokens,
         'total_response_tokens': total_response_tokens,
+        'ideal_response_tokens_per_replica': ideal_response_tokens_per_replica,
+        'ideal_tokens_per_replica': ideal_tokens_per_replica,
         'replicas': [
             {
                 'replica_id': i,
@@ -145,14 +155,15 @@ def schedule_prompts(json_file: str, num_replicas: int = None, output_file: str 
                         'prompt_length': prompt_stats[pid]['prompt_length'],
                         'avg_response_length': prompt_stats[pid]['avg_response_length'],
                         'estimated_total_tokens': prompt_stats[pid]['estimated_total_tokens'],
+                        'bin_packing_weight': prompt_stats[pid]['bin_packing_weight'],
                     }
                     for pid, _ in bin_items
                 ],
-                'total_tokens': float(bin_sum),
+                'total_response_tokens': float(bin_sum),  # bin_sum是基于response tokens的
                 'num_prompts': len(bin_items),
-                'avg_tokens_per_prompt': float(bin_sum / len(bin_items)) if len(bin_items) > 0 else 0,
-                'deviation_from_ideal': float(bin_sum - ideal_tokens_per_replica),
-                'deviation_percent': float((bin_sum - ideal_tokens_per_replica) / ideal_tokens_per_replica * 100) if ideal_tokens_per_replica > 0 else 0
+                'avg_response_tokens_per_prompt': float(bin_sum / len(bin_items)) if len(bin_items) > 0 else 0,
+                'deviation_from_ideal_response': float(bin_sum - ideal_response_tokens_per_replica),
+                'deviation_percent': float((bin_sum - ideal_response_tokens_per_replica) / ideal_response_tokens_per_replica * 100) if ideal_response_tokens_per_replica > 0 else 0
             }
             for i, (bin_items, bin_sum) in enumerate(zip(bins, bin_sums))
         ],

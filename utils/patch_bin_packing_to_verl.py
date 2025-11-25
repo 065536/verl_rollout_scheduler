@@ -29,10 +29,9 @@ for name, source in source_files.items():
 
 print("\n✅ All files copied successfully!")
 print("\nNote: You still need to manually patch ray_trainer.py with the bin packing methods.")
-print("The methods are:")
+print("The method to add is:")
 print("  - _apply_bin_packing_schedule()")
-print("  - _apply_bin_packing_schedule_validation()")
-print("And add calls to these methods in:")
+print("Add calls to this method in:")
 print("  - fit() method (after gen_batch_output.repeat())")
 print("  - _validate() method (after test_batch.repeat())")
 

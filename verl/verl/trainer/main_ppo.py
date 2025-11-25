@@ -73,27 +73,34 @@ def run_ppo(config, task_runner_class=None) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    if task_runner_class is None:
-        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+    debug_mode = os.getenv("VERL_DEBUG", "0") == "1"
 
-    # Create a remote instance of the TaskRunner class, and
-    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
-    if (
-        is_cuda_available
-        and config.global_profiler.tool == "nsys"
-        and config.global_profiler.get("steps") is not None
-        and len(config.global_profiler.get("steps", [])) > 0
-    ):
-        from verl.utils.import_utils import is_nvtx_available
-
-        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
-        nsight_options = OmegaConf.to_container(
-            config.global_profiler.global_tool_config.nsys.controller_nsight_options
-        )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+    if debug_mode:
+        print("[DEBUG] VERL_DEBUG=1 detected, running TaskRunner locally for interactive debugging.")
+        runner = TaskRunner()
+        runner.run(config)
     else:
-        runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+        if task_runner_class is None:
+            task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+
+        # Create a remote instance of the TaskRunner class, and
+        # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+        if (
+            is_cuda_available
+            and config.global_profiler.tool == "nsys"
+            and config.global_profiler.get("steps") is not None
+            and len(config.global_profiler.get("steps", [])) > 0
+        ):
+            from verl.utils.import_utils import is_nvtx_available
+
+            assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+            nsight_options = OmegaConf.to_container(
+                config.global_profiler.global_tool_config.nsys.controller_nsight_options
+            )
+            runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        else:
+            runner = task_runner_class.remote()
+        ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -242,6 +249,15 @@ class TaskRunner:
             config: Training configuration object containing all parameters needed
                    for setting up and running the PPO training process.
         """
+        # DEBUG_BREAKPOINT_TaskRunner.run
+        import os
+        if os.getenv("VERL_DEBUG", "0") == "1":
+            import ipdb
+            print("\n======================================================================")
+            print(f"🐛 DEBUG BREAKPOINT: TaskRunner.run")
+            print(f"======================================================================\n")
+            ipdb.set_trace()
+        
         # Print the initial configuration. `resolve=True` will evaluate symbolic values.
         from pprint import pprint
 

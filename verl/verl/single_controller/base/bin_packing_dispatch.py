@@ -45,10 +45,38 @@ def dispatch_bin_packing_data_proto(worker_group: WorkerGroup, *args, **kwargs):
         from verl.single_controller.base.decorator import dispatch_dp_compute_data_proto
         return dispatch_dp_compute_data_proto(worker_group, *args, **kwargs)
     
-    # 获取TP size（从worker_group或config中）
-    tp_size = getattr(worker_group, '_tp_size', None)
+    # 获取TP size（从多个来源尝试获取）
+    tp_size = None
+    
+    # 1. 首先尝试从DataProto的meta_info中获取（最可靠）
+    # 检查args中的DataProto
+    if len(args) > 0 and isinstance(args[0], DataProto):
+        tp_size = args[0].meta_info.get("tp_size", None)
+    
+    # 检查kwargs中的DataProto
     if tp_size is None:
-        # 尝试从环境变量或配置中获取
+        for val in kwargs.values():
+            if isinstance(val, DataProto):
+                tp_size = val.meta_info.get("tp_size", None)
+                if tp_size is not None:
+                    break
+    
+    # 2. 尝试从worker_group获取
+    if tp_size is None:
+        tp_size = getattr(worker_group, '_tp_size', None)
+    
+    # 3. 尝试从worker_group的config获取
+    if tp_size is None:
+        try:
+            if hasattr(worker_group, 'config'):
+                tp_size = getattr(worker_group.config, 'tensor_model_parallel_size', None)
+            elif hasattr(worker_group, '_config'):
+                tp_size = getattr(worker_group._config, 'tensor_model_parallel_size', None)
+        except:
+            pass
+    
+    # 4. 尝试从环境变量获取
+    if tp_size is None:
         tp_size = int(os.getenv("VERL_TP_SIZE", "1"))
     
     num_workers = worker_group.world_size

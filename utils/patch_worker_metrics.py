@@ -137,10 +137,34 @@ def patch_trainer_collect_timing():
                     'replica_id': 0,
                 })
             
-            # Distribute tokens across workers (estimate)
-            tokens_per_worker = total_response_tokens / num_workers if num_workers > 0 else total_response_tokens
+            # Calculate per-worker/replica tokens based on actual prompt assignment
+            # For default mode, use sequential assignment (each replica gets num_original_prompts / num_replicas prompts)
+            per_replica_tokens = {}
+            prompts_per_replica = num_original_prompts // num_replicas
+            remainder = num_original_prompts % num_replicas
+            
+            prompt_idx = 0
+            for replica_id in range(num_replicas):
+                # Calculate how many prompts this replica should get
+                num_prompts = prompts_per_replica + (1 if replica_id < remainder else 0)
+                replica_tokens = 0
+                for _ in range(num_prompts):
+                    if prompt_idx < num_original_prompts:
+                        # Sum all n generations for this prompt
+                        if prompt_idx in per_prompt_response_lengths:
+                            replica_tokens += sum(per_prompt_response_lengths[prompt_idx])
+                        prompt_idx += 1
+                per_replica_tokens[replica_id] = replica_tokens
+            
+            # Distribute tokens to workers based on replica assignment
             for worker_data in per_worker_times:
-                worker_data['response_tokens'] = int(tokens_per_worker)
+                replica_id = worker_data['replica_id']
+                if replica_id in per_replica_tokens:
+                    # Each worker in a replica gets the same tokens (TP group shares the work)
+                    worker_data['response_tokens'] = int(per_replica_tokens[replica_id])
+                else:
+                    # Fallback: average distribution
+                    worker_data['response_tokens'] = int(total_response_tokens / num_workers)
             
             # Group workers into replicas and record per-replica wall clock time
             # Note: "Replica" is the official VERL term (RolloutReplica class)
